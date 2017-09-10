@@ -171,7 +171,10 @@ var processBody = function(data,page,head,body){
       var btnAdd='',btnEdit='',btnDel='';
       td = '<td><a class="tooltips" title="查看详情" data-toggle="modal" data-target="#myViewModal" onclick="view(\'ecs\',\''+v.InstanceId+'\')">' + v.InstanceId + '</a></td>';
       tr.append(td);
-      td = '<td>' + ((v.PrivateIpAddress)?v.PrivateIpAddress: v.PublicIpAddress ) + '</td>';
+
+      var ipShow = (v.PrivateIpAddress ? (v.PrivateIpAddress + " [内网]<br/>") : "") + (v.PublicIpAddress ? (v.PublicIpAddress + " [公网]") : "");
+
+      td = '<td>' + ipShow + '</td>';
       tr.append(td);
       td = '<td><a class="tooltips" title="查看详情" data-toggle="modal" data-target="#myViewModal" onclick="view(\'cluster\',\''+v.Cluster.Id+'\')">' + v.Cluster.Name + '</a></td>';
       tr.append(td);
@@ -238,6 +241,9 @@ var change=function(step){
     case 'delete':
       postData=JSON.parse(postData.ecs);
       actionDesc='删除';
+      break;
+    case 'addPhyDev':
+      actionDesc='添加';
       break;
     default:
       actionDesc=action;
@@ -428,11 +434,11 @@ var twiceCheck=function(action,idx,desc,status){
           if(!desc) desc=idx;
           if(desc) ecsIps=(ecsIps)?','+desc:desc;
           cache.ecs_del[desc]=idx;
-          if(status>0&&status<5){
+          if((status>0&&status<5)||status==7){
             postDel.push(idx);
             list+='<span class="col-sm-3">'+desc+'</span>';
           }else{
-            notice='只能删除"未初始化","初始化中","初始化超时","初始化完成"的机器!';
+            notice='只能删除"未初始化","初始化中","初始化超时","初始化完成","初始化失败"的机器!';
             list+='<span class="col-sm-3">'+desc+'('+getStatusAlias(status)+')</span>';
             count--;
           }
@@ -647,7 +653,7 @@ var getStatusAlias = function(status){
     case 6:
       str='<span class="badge bg-purple">机器删除中</span>';break;
     case 7:
-      str='<span class="badge bg-red">错误状态</span>';break;
+      str='<span class="badge bg-red">初始化失败</span>';break;
     default:
       str='<span class="badge">未知状态</span>';break;
   }
@@ -793,4 +799,13 @@ var viewLog=function(idx,desc){
     $('#myViewModalBody').html(text);
     NProgress.done();
   }
+}
+
+
+
+
+var checkPhyDev=function(){
+  var disabled=false;
+  if($('#InstanceList').val()=='') disabled=true;
+  $('#btnCommit').attr('disabled',disabled)
 }

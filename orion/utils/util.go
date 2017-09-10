@@ -17,7 +17,6 @@
  *    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
  */
 
-
 package utils
 
 import (
@@ -42,4 +41,8 @@ func ToInt(v interface{}) (int, error) {
 
 	return -1, errors.New("cannot convert to int:" + fmt.Sprintln(v) +
 		", type : " + reflect.TypeOf(v).String())
+}
+
+func GetCorrelationId(fid int, batchId int) string {
+	return fmt.Sprintf("%d-%d", fid, batchId)
 }

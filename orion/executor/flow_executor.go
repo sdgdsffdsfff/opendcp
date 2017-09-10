@@ -17,7 +17,6 @@
  *    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
  */
 
-
 package executor
 
 import (
@@ -25,20 +24,23 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/astaxie/beego"
+
 	"weibo.com/opendcp/orion/handler"
 	"weibo.com/opendcp/orion/models"
 	"weibo.com/opendcp/orion/service"
+	"weibo.com/opendcp/orion/utils"
 )
 
 var (
 	// Executor is the singleton FlowExecutor instance to run all tasks.
-	Executor = &FlowExecutor{}
-
+	Executor    = &FlowExecutor{}
 	flowService = service.Flow
+	logService  = service.Logs
 
 	// Default retry option
 	dftRetryOpt = &models.RetryOption{
@@ -71,16 +73,19 @@ type FlowExecutor struct {
 // Run creates a flow instance from the given template id, and nodes, and
 // starts the flow instance.
 func (exec *FlowExecutor) Run(tplID int, name string, option *ExecOption,
-	nodes []*models.Node,context map[string]interface{}) error {
+	nodes []*models.Node, context map[string]interface{}) error {
 
-	fi, err := exec.Create(tplID, name, option, nodes, context)
+	fis, err := exec.Create(tplID, name, option, nodes, context)
 	if err != nil {
 		return err
 	}
 
-	err = exec.Start(fi)
-	if err != nil {
-		return err
+	for _, fi := range fis {
+		ins := fi
+		err = exec.Start(ins)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
@@ -88,9 +93,12 @@ func (exec *FlowExecutor) Run(tplID int, name string, option *ExecOption,
 
 // Create creates a flow instance with given template id, and nodes.
 func (exec *FlowExecutor) Create(tplID int, name string, option *ExecOption,
-	nodes []*models.Node, context map[string]interface{}) (*models.Flow, error) {
+	nodes []*models.Node, context map[string]interface{}) ([]*models.Flow, error) {
 
 	beego.Info("Create new task from template[", tplID, "]")
+
+	nodesarray := make(map[int][]*models.Node)
+	var instances []*models.Flow
 
 	flow := &models.FlowImpl{Id: tplID}
 	err := flowService.GetBase(flow)
@@ -110,17 +118,9 @@ func (exec *FlowExecutor) Create(tplID int, name string, option *ExecOption,
 	}
 
 	// make sure all nodes are in the same pool
-	poolID := -1
 	for _, node := range nodes {
 		pid := node.Pool.Id
-		if poolID == -1 {
-			poolID = pid
-		} else {
-			if pid != poolID {
-				beego.Error("Nodes are not in the same pool")
-				return nil, errors.New("nodes not in the same pool")
-			}
-		}
+		nodesarray[pid] = append(nodesarray[pid], node)
 	}
 
 	var stepOps []*models.StepOption
@@ -131,12 +131,12 @@ func (exec *FlowExecutor) Create(tplID int, name string, option *ExecOption,
 	}
 
 	//merge override params with params
-	overrideParams, ok:= context["overrideParams"].(map[string]interface{})
+	overrideParams, ok := context["overrideParams"].(map[string]interface{})
 	if !ok {
 		beego.Error("bad overrideParams:", context["overrideParams"])
 		return nil, errors.New("bad overrideParams!")
 	}
-	exec.mergeParams(stepOps, overrideParams)
+	exec.MergeParams(stepOps, overrideParams)
 
 	mergedBytes, _ := json.Marshal(stepOps)
 	merged := string(mergedBytes)
@@ -149,28 +149,32 @@ func (exec *FlowExecutor) Create(tplID int, name string, option *ExecOption,
 		beego.Error("bad opUser:", context["opUser"])
 		return nil, errors.New("bad opUser!")
 	}
-	instance, err := exec.createFlowInstance(name, flow, &models.Pool{Id: poolID}, stepOps, option, opUser)
-	if err != nil {
-		beego.Error("Fail to create flow instance", err)
-		return nil, err
+
+	for pid, node := range nodesarray {
+		poolID := pid
+		poolNode := node
+		instance, err := exec.createFlowInstance(name, flow, &models.Pool{Id: poolID}, stepOps, option, opUser)
+		if err != nil {
+			beego.Error("Fail to create flow instance", err)
+			return nil, err
+		}
+		states, err := exec.createNodeStates(instance, poolNode)
+		if err != nil {
+			beego.Error("Fail to create node states for flow: ", instance.Name, err)
+			flowService.DeleteBase(instance)
+			return nil, err
+		}
+		// create batches
+		err = exec.createBatches(instance, states, option.MaxNum)
+		if err != nil {
+			beego.Error("Fail to create batches for flow: ", instance.Name, err)
+			flowService.DeleteBase(instance)
+			return nil, err
+		}
+		instances = append(instances, instance)
 	}
 
-	states, err := exec.createNodeStates(instance, nodes)
-	if err != nil {
-		beego.Error("Fail to create node states for flow: ", instance.Name, err)
-		flowService.DeleteBase(instance)
-		return nil, err
-	}
-
-	// create batches
-	err = exec.createBatches(instance, states, option.MaxNum)
-	if err != nil {
-		beego.Error("Fail to create batches for flow: ", instance.Name, err)
-		flowService.DeleteBase(instance)
-		return nil, err
-	}
-
-	return instance, nil
+	return instances, nil
 }
 
 // Start starts an existing flow instance.
@@ -178,21 +182,24 @@ func (exec *FlowExecutor) Start(flow *models.Flow) error {
 	lock.Lock()
 	defer lock.Unlock()
 
-	if !exec.isFlowInState(flow, models.STATUS_INIT) &&
-		!exec.isFlowInState(flow, models.STATUS_STOPPED) {
+	correlationId := exec.getCorrelationId(flow.Id, 0)
 
-		return errors.New("Flow " + flow.Name +
-			" is not in state init/stopped: " + strconv.Itoa(flow.Status))
+	if exec.isFlowInState(flow, models.STATUS_RUNNING) {
+		logInfo := "Flow " + flow.Name + " is in state running: " + strconv.Itoa(flow.Status) + " do not start"
+		logService.Info(flow.Id, 0, correlationId, logInfo)
+
+		return errors.New(logInfo)
 	}
 
-	exec.setFlowStatus(flow, models.STATUS_RUNNING)
+	exec.SetFlowStatus(flow, models.STATUS_RUNNING)
 
 	// run the flow
 	job := func() error {
-		beego.Info("Run flow...")
+		logService.Info(flow.Id, 0, correlationId, "Run flow...")
+
 		err := exec.runFlow(flow)
 		if err != nil {
-			beego.Error("Run flow error", err)
+			logService.Error(flow.Id, 0, correlationId, "Run flow error：", err)
 			return err
 		}
 
@@ -226,7 +233,7 @@ func (exec *FlowExecutor) Pause(flow *models.Flow) error {
 		return errors.New("Flow " + flow.Name + " is not running")
 	}
 
-	return exec.setFlowStatus(flow, models.STATUS_STOPPED)
+	return exec.SetFlowStatus(flow, models.STATUS_STOPPED)
 }
 
 // Stop stopped a running flow by setting its status to SUCCESS.
@@ -247,10 +254,10 @@ func (exec *FlowExecutor) Stop(flow *models.Flow) error {
 		return errors.New("Flow " + flow.Name + " already finished")
 	}
 
-	return exec.setFlowStatus(flow, models.STATUS_SUCCESS)
+	return exec.SetFlowStatus(flow, models.STATUS_SUCCESS)
 }
 
-func (exec *FlowExecutor) setFlowStatus(flow *models.Flow, status int) error {
+func (exec *FlowExecutor) SetFlowStatus(flow *models.Flow, status int) error {
 	beego.Debug("Set flow", flow.Name, "status =", status)
 	flow.Status = status
 	flow.UpdatedTime = time.Now()
@@ -287,98 +294,213 @@ func (exec *FlowExecutor) isRunning(flow *models.Flow) bool {
 
 // run the task by batches.
 func (exec *FlowExecutor) runFlow(flow *models.Flow) error {
-	beego.Info("Start running flow[", flow.Name, ",", flow.Id, "]")
-	defer beego.Info("Finish running flow[", flow.Name, ",", flow.Id, "]")
+	correlationId := exec.getCorrelationId(flow.Id, 0)
+
+	logService.Info(flow.Id, 0, correlationId, fmt.Sprintf("Start running flow[%s,%d]", flow.Name, flow.Id))
+	defer func() {
+		logService.Info(flow.Id, 0, correlationId, fmt.Sprintf("Finish running flow[%s,%d]", flow.Name, flow.Id))
+	}()
 
 	if !exec.isRunning(flow) {
-		beego.Info("Flow", flow.Name, flow.Id, "state =", flow.Status,
-			"not in running state, ignore")
+		logService.Info(flow.Id, 0, correlationId, fmt.Sprintf("Flow %s %d state =%d not in running state, ignore", flow.Name, flow.Id, flow.Status))
 		return nil
 	}
 
 	// get all steps
 	steps, stepOps, err := exec.getSteps(flow)
 	if err != nil {
-		beego.Error("Get steps fails: " + err.Error())
+		logService.Error(flow.Id, 0, correlationId, "Get steps fails: "+err.Error())
+		exec.SetFlowStatus(flow, models.STATUS_FAILED)
 		return err
 	}
 
+	if len(steps) < 1 {
+		logService.Error(flow.Id, 0, correlationId, "step length bellow 1 is: "+flow.Options)
+		exec.SetFlowStatus(flow, models.STATUS_FAILED)
+		return errors.New("step length bellow 1 is: " + flow.Options)
+	}
+
 	// load batches
-	beego.Info("Load batches for flow", flow.Name, flow.Id)
+	logService.Info(flow.Id, 0, correlationId, fmt.Sprintf("Load batches for flow name:%s,id:%d", flow.Name, flow.Id))
+
 	var batches []*models.FlowBatch
 	flowService.ListByPageWithFilter(0, 1000, models.FlowBatch{}, &batches, "Flow", flow.Id)
 	for _, batch := range batches {
 		batch.Flow = flow
 	}
-	beego.Info("There are", len(batches), "batches for flow", flow.Name)
+
+	logService.Info(flow.Id, 0, correlationId, fmt.Sprintf("There are %d batches for flow %s", len(batches), flow.Name))
 
 	// load node states
-	idStateMap, err := exec.loadNodeStates(flow)
+	idStateMap, stopnodesNum, oknodesNum, err := exec.loadNodeStates(flow)
 	if err != nil {
-		return err
-	}
-
-	// execute flow by batch
-	for i, batch := range batches {
-		beego.Info("Execute batch", i+1, "of flow", flow.Name)
-		if !exec.isRunning(flow) {
-			beego.Info("Flow", flow.Name, flow.Id, "state =", flow.Status,
-				"not in running state, ignore")
-			return nil
+		logService.Error(flow.Id, 0, correlationId, "load node states happen error: "+err.Error())
+		if stopnodesNum != 0 {
+			exec.SetFlowStatus(flow, models.STATUS_STOPPED)
+			return err
 		}
-
-		switch batch.Status {
-		case models.STATUS_SUCCESS, models.STATUS_FAILED:
-			beego.Info("Batch", i+1, "already finished with status",
-				batch.Status, ", skip")
-			continue
-		case models.STATUS_INIT:
-			beego.Info("Batch", i+1, "not stated yet, start")
-			err = exec.runBatch(batch, idStateMap, steps, stepOps)
-		case models.STATUS_RUNNING:
-			beego.Info("Batch", i+1, "already running, rerun")
-			err = exec.runBatch(batch, idStateMap, steps, stepOps)
-		}
-
-		if err != nil {
-			beego.Error("Batch", i+1, "fails:", err)
-			exec.setFlowStatus(flow, models.STATUS_FAILED)
+		if oknodesNum == 0 {
+			exec.SetFlowStatus(flow, models.STATUS_FAILED)
+			return err
+		} else {
+			exec.SetFlowStatus(flow, models.STATUS_SUCCESS)
 			return err
 		}
 	}
 
-	exec.setFlowStatus(flow, models.STATUS_SUCCESS)
+	//如果没有要执行的节点，任务执行成功
+	beego.Debug(len(idStateMap))
+	logService.Debug(flow.Id, 0, correlationId, "load node length: "+strconv.Itoa(len(idStateMap)))
+	if len(idStateMap) == 0 {
+		logService.Warn(flow.Id, 0, correlationId, "load node length: "+strconv.Itoa(len(idStateMap)))
+		if stopnodesNum != 0 {
+			logService.Warn(flow.Id, 0, correlationId, "load stopped node length: "+strconv.Itoa(stopnodesNum))
+			exec.SetFlowStatus(flow, models.STATUS_STOPPED)
+			return nil
+		}
+		if oknodesNum != 0 {
+			exec.SetFlowStatus(flow, models.STATUS_SUCCESS)
+			return nil
+		}
+		exec.SetFlowStatus(flow, models.STATUS_FAILED)
+		return nil
+	}
+
+	// execute flow by batch
+	for i, batch := range batches {
+		correlationId = exec.getCorrelationId(flow.Id, batch.Id)
+
+		logService.Info(flow.Id, 0, correlationId, fmt.Sprintf("Execute batch %d of flow %s ", i+1, flow.Name))
+
+		if !exec.isRunning(flow) {
+			logService.Info(flow.Id, 0, correlationId, fmt.Sprintf("Flow %s %d state =%d not in running state, ignore", flow.Name, flow.Id, flow.Status))
+			return nil
+		}
+		stateCode := models.STATUS_SUCCESS
+		switch batch.Status {
+		case models.STATUS_SUCCESS:
+			logService.Info(flow.Id, 0, correlationId, fmt.Sprintf("Batch %d already finished with status %d , skip", i+1, batch.Status))
+
+			stateCode, err = exec.runBatch(batch, idStateMap, oknodesNum, steps, stepOps)
+		case models.STATUS_INIT:
+			logService.Info(flow.Id, 0, correlationId, fmt.Sprintf("Batch %d not stated yet, start", i+1))
+
+			stateCode, err = exec.runBatch(batch, idStateMap, oknodesNum, steps, stepOps)
+		case models.STATUS_RUNNING:
+			logService.Info(flow.Id, 0, correlationId, fmt.Sprintf("Batch %d already running, rerun", i+1))
+
+			stateCode, err = exec.runBatch(batch, idStateMap, oknodesNum, steps, stepOps)
+		case models.STATUS_FAILED:
+			logService.Info(flow.Id, 0, correlationId, fmt.Sprintf("Batch %d stated fail, start", i+1))
+
+			stateCode, err = exec.runBatch(batch, idStateMap, oknodesNum, steps, stepOps)
+		case models.STATUS_STOPPED:
+			logService.Info(flow.Id, 0, correlationId, fmt.Sprintf("Batch %d stated stoped, start", i+1))
+
+			stateCode, err = exec.runBatch(batch, idStateMap, oknodesNum, steps, stepOps)
+		}
+
+		if err != nil {
+			logService.Error(flow.Id, 0, correlationId, fmt.Sprintf("Batch %d fails:", i+1), err)
+			if oknodesNum != 0 {
+				exec.SetFlowStatus(flow, models.STATUS_SUCCESS)
+				return err
+			}
+			exec.SetFlowStatus(flow, models.STATUS_FAILED)
+			return err
+		} else {
+			if stateCode == models.STATUS_STOPPED {
+				exec.SetFlowStatus(flow, models.STATUS_STOPPED)
+				return nil
+			}
+			if stateCode == models.STATUS_FAILED && oknodesNum == 0 {
+				exec.SetFlowStatus(flow, models.STATUS_FAILED)
+				return nil
+			}
+		}
+
+	}
+	exec.SetFlowStatus(flow, models.STATUS_SUCCESS)
 	return nil
 }
 
 // Run a batch of task.
-func (exec *FlowExecutor) runBatch(batch *models.FlowBatch, stateMap map[int]*models.NodeState,
-	steps []*models.ActionImpl, stepOptions []*models.StepOption) error {
+func (exec *FlowExecutor) runBatch(batch *models.FlowBatch, stateMap map[int]*models.NodeState, oknodesNum int,
+	steps []*models.ActionImpl, stepOptions []*models.StepOption) (int, error) {
 
-	beego.Info("Run batch, flow:", batch.Flow.Name, "batchId:", batch.Id)
-	defer beego.Info("Finish run batch, flow:", batch.Flow.Name, "batchId:", batch.Id)
+	fid := batch.Flow.Id
+	correlationId := exec.getCorrelationId(fid, batch.Id)
+
+	logService.Info(fid, batch.Id, correlationId, fmt.Sprintf("Run batch, flow:%s batchId:%d", batch.Flow.Name, batch.Id))
+
+	defer func() {
+		logService.Info(fid, batch.Id, correlationId, fmt.Sprintf("Finish run batch, flow:%s batchId:%d", batch.Flow.Name, batch.Id))
+	}()
 
 	// load nodes & node states
-	states, err := exec.getBatchNodeStates(batch, stateMap)
+	states, err := exec.getBatchNodeStatesByStates(batch, stateMap)
+	//	states, err := exec.getBatchNodeStates(batch, stateMap)
 	if err != nil {
-		return err
+		logService.Error(fid, batch.Id, correlationId, fmt.Sprintf("getBatchNodeStatesByStates error, flow:%s batchId:%d", batch.Flow.Name, batch.Id))
+		return models.STATUS_FAILED, err
 	}
-	beego.Debug("Batch[", batch.Id, "] contains", len(states), "nodes")
 
-	all := states
-	for i, step := range steps {
-		beego.Debug("Run step", step.Name, "of batch[", batch.Id, "]")
+	logService.Debug(fid, batch.Id, correlationId, fmt.Sprintf("Batch[%d] contains %d nodes", batch.Id, len(states)))
+
+	//all := states
+	var theStep_index = len(steps) - 1
+	for stepNum, step := range steps {
+		var tempall []*models.NodeState
+		//需要对all进行筛选，当步骤已经成功的不需要重新再次执行
+		for temi := 0; temi < len(states); temi++ {
+			if states[temi].Status == models.STATUS_INIT || states[temi].Status == models.STATUS_RUNNING {
+				tempall = append(tempall, states[temi])
+			}
+			if states[temi].Status == models.STATUS_FAILED && stepNum == states[temi].StepNum {
+				tempall = append(tempall, states[temi])
+			}
+			if states[temi].Status == models.STATUS_STOPPED && stepNum == states[temi].StepNum {
+				tempall = append(tempall, states[temi])
+			}
+		}
+
+		//如果该步骤没有节点执行，则该步骤直接跳过
+		if len(tempall) == 0 && stepNum != theStep_index {
+			continue
+		}
+		//如果该步骤没有执行节点，在最后一步，则最后结果为失败
+		if len(tempall) == 0 && stepNum == theStep_index {
+			if oknodesNum != 0 {
+				exec.allSuccess(batch, step, stepNum, tempall)
+				return models.STATUS_SUCCESS, nil
+			}
+			logService.Warn(fid, batch.Id, correlationId, "last step: "+step.Name+"has none ok nodes")
+			exec.allFailed(batch, step, stepNum, tempall)
+			return models.STATUS_FAILED, nil
+		}
+		//此处从数据读取是否需要暂停
+		flow, _ := flowService.GetFlowWithRel(fid)
+		if flow.Status == models.STATUS_STOPPED {
+			logService.Warn(fid, batch.Id, correlationId, "the step: "+step.Name+"begin stop!")
+			exec.allStoped(batch, step, stepNum, tempall)
+			return models.STATUS_STOPPED, nil
+		}
+		logService.Debug(fid, batch.Id, correlationId, fmt.Sprintf("Run step %s of batch[%d]", step.Name, batch.Id))
 
 		// run step using handler
 		handler := handler.GetHandler(step.Type)
 		if handler == nil {
-			beego.Error("Handler not found for type", step.Type)
-			exec.allFailed(batch, step, all)
-			return errors.New("handler not found for type[" + step.Type + "]")
+			logService.Error(fid, batch.Id, correlationId, fmt.Sprintf("Handler not found for type %s", step.Type))
+			if oknodesNum != 0 {
+				exec.allSuccess(batch, step, stepNum, tempall)
+				return models.STATUS_SUCCESS, nil
+			}
+			exec.allFailed(batch, step, stepNum, tempall)
+			return models.STATUS_FAILED, errors.New("handler not found for type[" + step.Type + "]")
 		}
 
 		// get param values
-		stepOption := stepOptions[i]
+		stepOption := stepOptions[stepNum]
 		stepParams := stepOption.Values
 
 		// get retry option
@@ -388,36 +510,83 @@ func (exec *FlowExecutor) runBatch(batch *models.FlowBatch, stateMap map[int]*mo
 		}
 
 		// use flow-batch id as correlation id
-		correlationId := fmt.Sprintf("%d-%d", batch.Flow.Id, batch.Id)
+		correlationId := exec.getCorrelationId(batch.Flow.Id, batch.Id)
 
-		all, _ = exec.runStep(handler, step, all, stepParams, retryOption, correlationId)
-
-		// if all nodes fail in this batch, then we assume this task fails
-		if len(all) == 0 {
-			beego.Error("Flow", batch.Flow.Name, "fails at batch[", batch.Id, "] step[",
-				step.Name)
-			exec.allFailed(batch, step, all)
-			return errors.New("Fail at step " + step.Name)
+		okNodes, errNodes := exec.RunStep(handler, step, stepNum, tempall, stepParams, retryOption, correlationId)
+		//失败的节点需要更新node数据库
+		for _, errNode := range errNodes {
+			errNode.Node.Status = models.STATUS_FAILED
+			service.Cluster.UpdateBase(errNode.Node)
 		}
+		//如果第一步是create_vm并且成功的节点为0, 直接返回错误
+		if stepNum == 0 && step.Name == "create_vm" {
+			if len(okNodes) == 0 && oknodesNum == 0 {
+				exec.allFailed(batch, step, stepNum, errNodes)
+				return models.STATUS_FAILED, errors.New("first step of create_vm all nodes is failed")
+			}
+		}
+		//如果该最后一步，成功0个节点，则最后结果为失败
+		if stepNum == theStep_index && len(okNodes) == 0 {
+			logService.Error(fid, batch.Id, correlationId, fmt.Sprintf("Flow %s fails at batch[%d] step[%s]", batch.Flow.Name, batch.Id, step.Name))
+			if oknodesNum != 0 {
+				exec.allSuccess(batch, step, stepNum, okNodes)
+				return models.STATUS_SUCCESS, nil
+			}
+			exec.allFailed(batch, step, stepNum, errNodes)
+			return models.STATUS_FAILED, errors.New("Fail at step " + step.Name)
+		}
+		//如果最后一步，成功的节点不为0，则最后的结果为成功
+		if stepNum == theStep_index && len(okNodes) != 0 {
+			for _, okNode := range okNodes {
+				okNode.Node.Status = models.STATUS_SUCCESS
+				service.Cluster.UpdateBase(okNode.Node)
+			}
+			exec.allSuccess(batch, step, stepNum, okNodes)
+			return models.STATUS_SUCCESS, nil
+		}
+		//更新内存中states成功的节点状态改为执行中
+		for temi := 0; temi < len(states); temi++ {
+			for oki := 0; oki < len(okNodes); oki++ {
+				if states[temi].Id == okNodes[oki].Id {
+					states[temi].Status = models.STATUS_RUNNING
+					states[temi].StepNum = stepNum
+				}
+			}
+		}
+		//更新内存中states失败的节点，更新为失败
+		for temi := 0; temi < len(states); temi++ {
+			for erri := 0; erri < len(errNodes); erri++ {
+				if states[temi].Id == errNodes[erri].Id {
+					states[temi].Status = models.STATUS_FAILED
+					states[temi].Steps = step.Name
+					states[temi].StepNum = stepNum
+				}
+			}
+		}
+
 	}
 
-	exec.allSuccess(batch, all)
-
-	return nil
+	//exec.allSuccess(batch, all, len(steps))
+	return models.STATUS_SUCCESS, nil
 }
 
 // runStep runs one step of a batch
-func (exec *FlowExecutor) runStep(h handler.Handler, step *models.ActionImpl,
+func (exec *FlowExecutor) RunStep(h handler.Handler, step *models.ActionImpl, stepNum int,
 	nstates []*models.NodeState, stepParams map[string]interface{},
 	retryOption *models.RetryOption, correlationId string) ([]*models.NodeState, []*models.NodeState) {
 
-	paramsBytes , _ := json.Marshal(stepParams)
+	paramsBytes, _ := json.Marshal(stepParams)
 	paramsJson := string(paramsBytes)
-	beego.Debug("Start running step", step.Name, "params:", paramsJson)
 
-	defer beego.Debug("Finish running step", step.Name)
+	fid := nstates[0].Flow.Id
+	batchId := nstates[0].Batch.Id
 
-	exec.updateStepStatus(nstates, step.Name, models.STATUS_RUNNING)
+	logService.Debug(fid, batchId, correlationId, fmt.Sprintf("Start running step %s params: %s", step.Name, paramsJson))
+	defer func() {
+		logService.Debug(fid, batchId, correlationId, fmt.Sprintf("Finish running step %s", step.Name))
+	}()
+
+	exec.updateStepStatus(nstates, step.Name, stepNum, models.STATUS_RUNNING)
 
 	toRun := nstates
 	var okNodes, errNodes []*models.NodeState
@@ -427,15 +596,16 @@ func (exec *FlowExecutor) runStep(h handler.Handler, step *models.ActionImpl,
 			time.Sleep(retryInterval * time.Second)
 		}
 
-		beego.Debug("Run step", step.Name, "for", i+1, "times")
+		logService.Debug(fid, batchId, correlationId, fmt.Sprintf("Run step %s for %d times", step.Name, i+1))
+
 		result := h.Handle(step, stepParams, toRun, correlationId)
 
 		// retry if failed
 		if result.Code == handler.CODE_ERROR {
 			errNodes = toRun
-			msg := fmt.Sprintf("Fail to run step [%s]: %s",
-				step.Name, result.Msg)
-			beego.Error(msg)
+			msg := fmt.Sprintf("Fail to run step [%s]: %s", step.Name, result.Msg)
+			logService.Error(fid, batchId, correlationId, msg)
+
 			continue
 		}
 
@@ -444,7 +614,8 @@ func (exec *FlowExecutor) runStep(h handler.Handler, step *models.ActionImpl,
 		if results == nil {
 			errNodes = toRun
 			msg := fmt.Sprintf("Node results is empty for [%s]", step.Name)
-			beego.Error(msg)
+			logService.Error(fid, batchId, correlationId, msg)
+
 			continue
 		}
 
@@ -454,12 +625,17 @@ func (exec *FlowExecutor) runStep(h handler.Handler, step *models.ActionImpl,
 			node := state.Node
 			nr := results[i]
 			if nr == nil {
-				beego.Warn("Result for node ", node.Id, node.Ip, " missing, set it as failed")
+				logService.Warn(fid, batchId, correlationId, fmt.Sprintf("Result for node %d %s missing, set it as failed", node.Id, node.Ip))
+
 				state.Status = models.STATUS_FAILED
 				state.Log += step.Name + ":" + "<Missing result>\n"
+				// update progress
+				state.Steps = step.Name
+				state.StepNum = stepNum
 				errNodes = append(errNodes, state)
 			} else {
-				beego.Debug("Result for node [", node.Id, node.Ip, "] is", nr.Code, nr.Data)
+				logService.Debug(fid, batchId, correlationId, fmt.Sprintf("Result for node [%d %s] is %d %s", node.Id, node.Ip, nr.Code, nr.Data))
+
 				if nr.Code == models.STATUS_SUCCESS {
 					okNodes = append(okNodes, state)
 					state.Status = models.STATUS_RUNNING
@@ -471,12 +647,13 @@ func (exec *FlowExecutor) runStep(h handler.Handler, step *models.ActionImpl,
 
 				// update progress
 				state.Steps = step.Name
+				state.StepNum = stepNum
 			}
 			state.UpdatedTime = time.Now()
 
 			err := flowService.UpdateBase(state)
 			if err != nil {
-				beego.Error("Fail to update state for node[", node.Id, node.Ip)
+				logService.Error(fid, batchId, correlationId, fmt.Sprintf("Fail to update state for node[%d %s]", node.Id, node.Ip))
 			}
 		}
 
@@ -495,16 +672,29 @@ func (exec *FlowExecutor) runStep(h handler.Handler, step *models.ActionImpl,
 
 	if retryOption.IgnoreError {
 		// if ignore error is true, set all failed nodes to success
-		exec.updateStepStatus(errNodes, "", models.STATUS_SUCCESS)
+		exec.updateStepStatus(errNodes, "", stepNum, models.STATUS_SUCCESS)
 		okNodes = nstates
 		errNodes = []*models.NodeState{}
 	} else {
-		exec.updateStepStatus(errNodes, "", models.STATUS_FAILED)
+		exec.updateStepStatus(errNodes, step.Name, stepNum, models.STATUS_FAILED)
 	}
 
 	return okNodes, errNodes
 }
 
+/**
+* xxxxxxx
+*
+* 注意这里的models.ActionImpl  不对应DB里任何表..只是一个用于获取对应handler的结构
+* 此结构里的声明是在models.在每个handler都有一个对应的初始化..
+* 结构里的type字段 会在runBatch里handler.GetHandler时..将会被用到
+*
+*
+* @access public
+* @param flow 单个需要被执行的任务信息
+* @param steps 由本FLOW中options的name字段关键词匹配过的handler信息..用于去获取对应handler..
+* @param stepOptions 本FLOW中的options
+ */
 func (exec *FlowExecutor) getSteps(flow *models.Flow) ([]*models.ActionImpl, []*models.StepOption, error) {
 	beego.Debug("Steps are", flow.Options)
 	var stepOptions []*models.StepOption
@@ -543,16 +733,35 @@ func (exec *FlowExecutor) loadFlowOption(flow *models.Flow) (*FlowOption) {
 }
 */
 
-func (exec *FlowExecutor) loadNodeStates(flow *models.Flow) (map[int]*models.NodeState, error) {
+func (exec *FlowExecutor) loadNodeStates(flow *models.Flow) (map[int]*models.NodeState, int, int, error) {
 	beego.Debug("Load nodes & states for flow", flow.Id)
 	states, err := flowService.GetNodeStatusByFlowId(flow.Id)
+
+	//进项筛选，当处于失败状态的节点(不是creat_vm)或者初始化的节点才会执行
+	var oknodes = 0
+	var stopnodes = 0
+	var tempnodeList []*models.NodeState
+	for _, state := range states {
+		if state.Status == models.STATUS_FAILED && !strings.EqualFold(state.Steps, "create_vm") {
+			tempnodeList = append(tempnodeList, state)
+		} else if state.Status == models.STATUS_STOPPED {
+			stopnodes++
+			tempnodeList = append(tempnodeList, state)
+		} else if state.Status == models.STATUS_INIT {
+			tempnodeList = append(tempnodeList, state)
+		} else if state.Status == models.STATUS_SUCCESS {
+			oknodes++
+		}
+	}
+	states = tempnodeList
+
 	if err != nil {
-		return nil, err
+		return nil, stopnodes, oknodes, err
 	}
 
 	if len(states) == 0 {
 		beego.Error("No node states found for flow:", flow.Id)
-		return nil, errors.New("No node states found for flow:" + strconv.Itoa(flow.Id))
+		return nil, stopnodes, oknodes, errors.New("No node states found for flow:" + strconv.Itoa(flow.Id))
 	}
 
 	nodeIDs := make([]int, len(states))
@@ -566,7 +775,7 @@ func (exec *FlowExecutor) loadNodeStates(flow *models.Flow) (map[int]*models.Nod
 	if len(nodes) != len(states) {
 		beego.Error("Flow", flow.Id, " len(nodes) =", len(nodes),
 			"len(states) =", len(states))
-		return nil, errors.New("node states")
+		return nil, stopnodes, oknodes, errors.New("node states")
 	}
 
 	beego.Debug("There are", len(nodes), "nodes for flow", flow.Name)
@@ -583,7 +792,24 @@ func (exec *FlowExecutor) loadNodeStates(flow *models.Flow) (map[int]*models.Nod
 		beego.Debug("Set state.Node =", state.Node.Ip)
 	}
 
-	return idStateMap, nil
+	return idStateMap, stopnodes, oknodes, nil
+}
+
+func (exec *FlowExecutor) getBatchNodeStatesByStates(batch *models.FlowBatch,
+	stateMap map[int]*models.NodeState) ([]*models.NodeState, error) {
+	states := make([]*models.NodeState, len(stateMap))
+	var i = 0
+	for k, v := range stateMap {
+		states[i] = v
+		if states[i] == nil {
+			msg := fmt.Sprintf("State not found for id=%d in state map", k)
+			beego.Error(msg)
+			return nil, errors.New(msg)
+		}
+		i++
+	}
+
+	return states, nil
 }
 
 func (exec *FlowExecutor) getBatchNodeStates(batch *models.FlowBatch,
@@ -613,7 +839,7 @@ func (exec *FlowExecutor) getBatchNodeStates(batch *models.FlowBatch,
  * Create a flow instance in DB, set its state to INIT
  */
 func (exec *FlowExecutor) createFlowInstance(name string, flow *models.FlowImpl, pool *models.Pool,
-	stepOps []*models.StepOption, option *ExecOption,opUser string) (*models.Flow, error) {
+	stepOps []*models.StepOption, option *ExecOption, opUser string) (*models.Flow, error) {
 
 	bytes, err := json.Marshal(stepOps)
 	if err != nil {
@@ -634,7 +860,6 @@ func (exec *FlowExecutor) createFlowInstance(name string, flow *models.FlowImpl,
 		CreatedTime: time.Now(),
 		UpdatedTime: time.Now(),
 	}
-
 	err = flowService.InsertBase(fi)
 	return fi, err
 }
@@ -644,14 +869,16 @@ func (exec *FlowExecutor) createNodeStates(flow *models.Flow, nodes []*models.No
 	states := make([]*models.NodeState, len(nodes))
 	for i, node := range nodes {
 		state := &models.NodeState{
-			Ip:     node.Ip,
-			VmId:   node.VmId,
-			Node:   node,
-			Flow:   flow,
-			Pool:   node.Pool,
-			Status: models.STATUS_INIT,
-			Log:    "",
-			Steps:  "[]",
+			Ip:          node.Ip,
+			VmId:        node.VmId,
+			Node:        node,
+			Flow:        flow,
+			Pool:        node.Pool,
+			Status:      models.STATUS_INIT,
+			Log:         "",
+			Steps:       "[]",
+			StepNum:     0,
+			CreatedTime: time.Now(),
 		}
 
 		// TODO batch insert all states
@@ -721,7 +948,7 @@ func (exec *FlowExecutor) createBatches(instance *models.Flow, states []*models.
 	return nil
 }
 
-func (exec *FlowExecutor) updateStepStatus(states []*models.NodeState, step string, stateCode int) error {
+func (exec *FlowExecutor) updateStepStatus(states []*models.NodeState, step string, stepNum int, stateCode int) error {
 	beego.Debug("Update node states for step", step, ", num of states is", len(states))
 
 	for _, state := range states {
@@ -729,6 +956,7 @@ func (exec *FlowExecutor) updateStepStatus(states []*models.NodeState, step stri
 		if step != "" {
 			state.Steps = step
 		}
+		state.StepNum = stepNum
 		state.UpdatedTime = time.Now()
 
 		beego.Debug("Set node state", state.Ip, " step =", state.Steps, "status =", stateCode)
@@ -741,28 +969,42 @@ func (exec *FlowExecutor) updateStepStatus(states []*models.NodeState, step stri
 	return nil
 }
 
-func (exec *FlowExecutor) allFailed(batch *models.FlowBatch, step *models.ActionImpl,
+func (exec *FlowExecutor) allFailed(batch *models.FlowBatch, step *models.ActionImpl, stepNum int,
 	states []*models.NodeState) error {
 
-	exec.updateStepStatus(states, step.Name, models.STATUS_FAILED)
+	exec.updateStepStatus(states, step.Name, stepNum, models.STATUS_FAILED)
 
 	batch.Status = models.STATUS_FAILED
+	batch.Step = stepNum
 	batch.UpdatedTime = time.Now()
 	flowService.UpdateBase(batch)
 	return nil
 }
 
-func (exec *FlowExecutor) allSuccess(batch *models.FlowBatch, states []*models.NodeState) error {
-	exec.updateStepStatus(states, "", models.STATUS_SUCCESS)
+func (exec *FlowExecutor) allSuccess(batch *models.FlowBatch, step *models.ActionImpl, stepNum int, states []*models.NodeState) error {
+	exec.updateStepStatus(states, step.Name, stepNum, models.STATUS_SUCCESS)
 
 	batch.Status = models.STATUS_SUCCESS
 	batch.UpdatedTime = time.Now()
+	batch.Step = stepNum
 	flowService.UpdateBase(batch)
 
 	return nil
 }
 
-func (exec *FlowExecutor) mergeParams(options []*models.StepOption,
+func (exec *FlowExecutor) allStoped(batch *models.FlowBatch, step *models.ActionImpl, stepNum int,
+	states []*models.NodeState) error {
+
+	exec.updateStepStatus(states, step.Name, stepNum, models.STATUS_STOPPED)
+
+	batch.Status = models.STATUS_STOPPED
+	batch.Step = stepNum
+	batch.UpdatedTime = time.Now()
+	flowService.UpdateBase(batch)
+	return nil
+}
+
+func (exec *FlowExecutor) MergeParams(options []*models.StepOption,
 	overrideParams map[string]interface{}) {
 
 	opMap := make(map[string]*models.StepOption)
@@ -790,4 +1032,8 @@ func (exec *FlowExecutor) mergeParams(options []*models.StepOption,
 			old[pk] = pv
 		}
 	}
+}
+
+func (exec *FlowExecutor) getCorrelationId(fid int, batchId int) string {
+	return utils.GetCorrelationId(fid, batchId)
 }

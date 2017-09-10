@@ -17,7 +17,6 @@
  *    Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1301  USA
  */
 
-
 package handler
 
 import (
@@ -28,10 +27,10 @@ import (
 
 	"github.com/astaxie/beego"
 
+	"strconv"
 	"weibo.com/opendcp/orion/models"
 	"weibo.com/opendcp/orion/service"
 	"weibo.com/opendcp/orion/utils"
-	"strconv"
 )
 
 const (
@@ -42,16 +41,24 @@ const (
 )
 
 const (
-	vmPending = iota
-	vmSuccess
-	vmUninit
-	vmIniting
-	vmInitTimeout
-	vmDeleted
-	vmUninstalling
-	vmUniTimeout
-	vmDeleting
-	vmError
+	//vmPending = iota
+	//vmSuccess
+	//vmUninit
+	//vmIniting
+	//vmInitTimeout
+	//vmDeleted
+	//vmUninstalling
+	//vmUniTimeout
+	//vmDeleting
+	//vmError
+	vmPending     = iota //正在创建
+	vmSuccess            //初始化完成
+	vmUninit             //未初始化
+	vmIniting            //正在初始化
+	vmInitTimeout        //初始化超时
+	vmDeleted            //资源已删除
+	vmDeleting           //正在删除
+	vmError              //初始化失败
 )
 
 var (
@@ -98,7 +105,12 @@ func (v *VMHandler) GetType() string {
 // Handle implements method of Handler.
 func (v *VMHandler) Handle(action *models.ActionImpl, actionParams map[string]interface{},
 	nodes []*models.NodeState, corrId string) *HandleResult {
-	beego.Debug("vm handler recieve new action: [", action.Name, "]")
+
+	fid := nodes[0].Flow.Id
+	batchId := nodes[0].Batch.Id
+	correlationId := utils.GetCorrelationId(fid, batchId)
+
+	logService.Debug(fid, batchId, correlationId, fmt.Sprintf("vm handler recieve new action: [%s]", action.Name))
 
 	switch action.Name {
 	case createVM:
@@ -106,7 +118,8 @@ func (v *VMHandler) Handle(action *models.ActionImpl, actionParams map[string]in
 	case returnVM:
 		return v.returnVMs(actionParams, nodes, corrId)
 	default:
-		beego.Error("Unknown VM action: " + action.Name)
+		logService.Error(fid, batchId, correlationId, fmt.Sprintf("Unknown VM action: %s", action.Name))
+
 		return Err("Unknown VM action: " + action.Name)
 	}
 }
@@ -116,27 +129,42 @@ func (v *VMHandler) createVMs(params map[string]interface{},
 	nodes []*models.NodeState, corrId string) *HandleResult {
 
 	num := len(nodes)
-	beego.Debug("creating vm, vm_type_id =", params[vmTypeId], reflect.TypeOf(params[vmTypeId]))
+
+	fid := nodes[0].Flow.Id
+	batchId := nodes[0].Batch.Id
+	correlationId := utils.GetCorrelationId(fid, batchId)
+
+	msg := fmt.Sprintf("creating vm, vm_type_id =%v vmTypeIdtype:%v", params[vmTypeId], reflect.TypeOf(params[vmTypeId]))
+	logService.Debug(fid, batchId, correlationId, msg)
+
 	cluStr := params[vmTypeId]
 	cluster, err := utils.ToInt(cluStr)
 	if err != nil {
-		beego.Error("Bad cluster:[", cluStr, "]")
+		logService.Error(fid, batchId, correlationId, fmt.Sprintf("Bad cluster:[%d]", cluStr))
+
 		return Err("Bad cluster")
 	}
 
 	// call create vm api
-	beego.Info("Creating VM in cluster", cluster, ", num=", num)
+	logService.Info(fid, batchId, correlationId, fmt.Sprintf("Creating VM in cluster %d, num=%d", cluster, num))
+
 	url := fmt.Sprintf(apiCreate, jupiterAddr, cluster, num)
-	header := map[string]interface{} {
+	header := map[string]interface{}{
 		"X-CORRELATION-ID": corrId,
 	}
 	resp, hr := v.callAPI("POST", url, nil, &header)
 	if hr != nil {
 		// remove all node since it fails here
 		for _, nodeState := range nodes {
-			beego.Info("Deleting node [", nodeState.Node.Id, "]")
-			service.Cluster.DeleteBase(nodeState.Node)
-
+			//logService.Info(fid, batchId, correlationId, fmt.Sprintf("Deleting node [%d],", nodeState.Node.Id))
+			//
+			//service.Cluster.DeleteBase(nodeState.Node)
+			nodeState.Node.Status = models.STATUS_FAILED
+			if nodeState.Node.Ip == "-" {
+				ip := fmt.Sprintf("%d", nodeState.Node.Id)
+				nodeState.Node.Ip = ip
+			}
+			service.Cluster.UpdateBase(nodeState.Node)
 			nodeState.Log = "[jupiter]: " + hr.Msg + "\n"
 			service.Cluster.UpdateBase(nodeState)
 		}
@@ -148,7 +176,8 @@ func (v *VMHandler) createVMs(params map[string]interface{},
 
 	tmpList, ok := content.([]interface{})
 	if !ok {
-		beego.Error("Bad id list", fmt.Sprint(content))
+		logService.Error(fid, batchId, correlationId, fmt.Sprintf("Bad id list content:%s", content))
+
 		return Err("Bad id list: " + fmt.Sprint(content))
 	}
 
@@ -159,8 +188,7 @@ func (v *VMHandler) createVMs(params map[string]interface{},
 	vmIds := list
 
 	if len(vmIds) != len(nodes) {
-		beego.Warn("Number of vm ids (", len(vmIds),
-			") doesn't equal that of nodes (", len(nodes), ")")
+		logService.Warn(fid, batchId, correlationId, fmt.Sprintf("Number of vm ids (%d) doesn't equal that of nodes (%d)", len(vmIds), len(nodes)))
 	}
 
 	// update nodes
@@ -174,36 +202,43 @@ func (v *VMHandler) createVMs(params map[string]interface{},
 	}
 
 	// for missing vm ids, mark then as failed
-	for i := 0; i < len(nodes) - len(vmIds) ; i ++ {
-		node := nodes[i + len(vmIds)]
+	for i := 0; i < len(nodes)-len(vmIds); i++ {
+		node := nodes[i+len(vmIds)]
 		node.Status = CODE_ERROR
 		node.UpdatedTime = time.Now()
+
 		service.Cluster.UpdateBase(node)
+		//service.Cluster.DeleteBase(node.Node)
+		node.Node.Status = models.STATUS_FAILED
+		ip := fmt.Sprintf("%d", node.Node.Id)
+		node.Node.Ip = ip
+		service.Cluster.UpdateBase(node.Node)
 	}
 
 	// start checking result
-	beego.Info("VM creating command sent for cluster:", cluster, ", vm ids = ", vmIds)
+	logService.Info(fid, batchId, correlationId, fmt.Sprintf("VM creating command sent for cluster:%d, vm ids = %v", cluster, vmIds))
+
 	var failed, done []string
 	for i := 0; i < timeout/5; i++ {
 		time.Sleep(5 * time.Second)
-		beego.Info("check result for times ", i+1)
+		logService.Info(fid, batchId, correlationId, fmt.Sprintf("check result for times %d", i+1))
 
 		url := fmt.Sprintf(apiCheck, jupiterAddr, strings.Join(list, ","))
 		msg, err := utils.Http.Get(url, nil)
 		if err != nil {
-			beego.Warn("check result err: \n", err)
+			logService.Warn(fid, batchId, correlationId, "check result err: \n")
 			continue
 		}
 
 		resp, err := utils.Json.ToMap(msg)
 		if err != nil {
-			beego.Error("bad response: ", msg, ", err:", err)
+			logService.Error(fid, batchId, correlationId, fmt.Sprintf("bad response: %s, err:%v", msg, err))
 			continue
 		}
 
 		statuses, ok := resp["content"].([]interface{})
 		if !ok {
-			beego.Error(`bad response "content": ` + msg)
+			logService.Error(fid, batchId, correlationId, fmt.Sprintf("bad response content: ", msg))
 			continue
 		}
 
@@ -215,18 +250,18 @@ func (v *VMHandler) createVMs(params map[string]interface{},
 			toDel := false
 			switch state {
 			case vmSuccess:
-				beego.Debug("Node[", id, "] OK")
+				logService.Debug(fid, batchId, correlationId, fmt.Sprintf("Node[%s] OK", id))
 				done = append(done, id)
 			case vmInitTimeout:
-				beego.Debug("Node[", id, "] init timeout")
+				logService.Debug(fid, batchId, correlationId, fmt.Sprintf("Node[%s] init timeout", id))
 				failed = append(failed, id)
 				toDel = true
 			case vmError, vmUninit:
-				beego.Debug("Node[", id, "] error")
+				logService.Debug(fid, batchId, correlationId, fmt.Sprintf("Node[%s] init error", id))
 				failed = append(failed, id)
 				toDel = true
 			default:
-				beego.Debug("Node[", id, "] in progress, status=", state)
+				logService.Debug(fid, batchId, correlationId, fmt.Sprintf("Node[%s] in progress, status=%d", id, state))
 				running = append(running, id)
 			}
 
@@ -245,8 +280,14 @@ func (v *VMHandler) createVMs(params map[string]interface{},
 
 			// if failed, remove the node from pool
 			if toDel {
-				beego.Info("Deleting node [", id, "] since it failed to create")
-				service.Cluster.DeleteBase(nodeMap[id].Node)
+				logService.Info(fid, batchId, correlationId, fmt.Sprintf("Deleting node [%s] since it failed to create", id))
+				nodeMap[id].Node.Status = models.STATUS_FAILED
+				if nodeMap[id].Node.Ip == "-" {
+					ip := fmt.Sprintf("%d", nodeMap[id].Node.Id)
+					nodeMap[id].Node.Ip = ip
+				}
+				service.Cluster.UpdateBase(nodeMap[id].Node)
+
 			}
 		}
 
@@ -261,18 +302,26 @@ func (v *VMHandler) createVMs(params map[string]interface{},
 	// this nodes are timeout, mark them as failed
 	if len(list) != 0 {
 		for _, id := range list {
-			beego.Debug("Node[", id, "] timeout")
+			logService.Debug(fid, batchId, correlationId, fmt.Sprintf("Node[%s] timeout", id))
+
 			failed = append(failed, id)
 			n := nodeMap[id]
 			n.Status = models.STATUS_FAILED
 			service.Cluster.UpdateBase(n)
 
-			beego.Info("Deleting node [", id, "] since it failed to create")
-			service.Cluster.DeleteBase(n.Node)
+			logService.Info(fid, batchId, correlationId, fmt.Sprintf("Ajust node [%s] since it failed to create", id))
+
+			n.Node.Status = models.STATUS_FAILED
+			if nodeMap[id].Node.Ip == "-" {
+				ip := fmt.Sprintf("%d", n.Node.Id)
+				n.Node.Ip = ip
+			}
+			service.Cluster.UpdateBase(n.Node)
 		}
 	}
 
-	beego.Info("All finished")
+	logService.Info(fid, batchId, correlationId, "All finished")
+
 	ret := make([]*NodeResult, len(nodes))
 	for _, vid := range done {
 		idx := idxMap[vid]
@@ -293,12 +342,12 @@ func (v *VMHandler) createVMs(params map[string]interface{},
 	}
 
 	// handle missing vms
-	for i := 0; i < len(nodes) - len(vmIds); i ++ {
+	for i := 0; i < len(nodes)-len(vmIds); i++ {
 		nr := &NodeResult{
 			Code: CODE_ERROR,
 			Data: "FAILED",
 		}
-		ret[i + len(vmIds)] = nr
+		ret[i+len(vmIds)] = nr
 	}
 
 	return &HandleResult{
@@ -321,23 +370,30 @@ func (v *VMHandler) returnVMs(params map[string]interface{},
 			cannotDelete[node.Id] = false
 		} else {
 			// for vmId == "", we cannot delete them
-			cannotDelete[node.Id] = true
+			if node.Ip != fmt.Sprintf("%d", node.Node.Id) {
+				cannotDelete[node.Id] = true
+			} else {
+				cannotDelete[node.Id] = false
+			}
 		}
 	}
-
-	url := fmt.Sprintf(apiReturn, jupiterAddr, strings.Join(ids, ","))
-	header := map[string]interface{} {
-		"X-CORRELATION-ID": corrId,
-		"APPKEY": SD_APPKEY,
-	}
-	_, hr := v.callAPI("DELETE", url, nil, &header)
-	if hr != nil {
-		return hr
+	if len(ids) != 0 {
+		url := fmt.Sprintf(apiReturn, jupiterAddr, strings.Join(ids, ","))
+		header := map[string]interface{}{
+			"X-CORRELATION-ID": corrId,
+			"APPKEY":           SD_APPKEY,
+		}
+		_, hr := v.callAPI("DELETE", url, nil, &header)
+		if hr != nil {
+			return hr
+		}
 	}
 
 	// delete nodes from pool
 	for _, node := range nodes {
 		if !cannotDelete[node.Id] {
+			//id := node.Node.Id
+			//service.Cluster.DeleteBase(node)
 			service.Cluster.DeleteBase(&models.Node{Id: node.Node.Id})
 		}
 	}
@@ -398,7 +454,7 @@ func (v *VMHandler) callAPI(method string, url string,
 }
 
 func (v *VMHandler) GetLog(nodeState *models.NodeState) string {
-	corrId , instanceId := nodeState.CorrId, nodeState.VmId
+	corrId, instanceId := nodeState.CorrId, nodeState.VmId
 	header := make(map[string]interface{})
 	header["X-CORRELATION-ID"] = corrId
 	header["X-SOURCE"] = "orion"

@@ -89,7 +89,8 @@ $arrIdx=array(
               <li>
                 <a><i class="fa fa-home"></i> Home <span class="fa fa-chevron-down"></span></a>
                 <ul class="nav child_menu">
-                  <li><a href="/">Dashboard</a></li>
+                    <!--<li class="current-page"><a href="/">Dashboard</a></li>-->
+                    <li class="current-page"><a href="/">Dashboard</a></li>
                 </ul>
               </li>
               <?php echo $navLeft;?>
@@ -224,6 +225,7 @@ $arrIdx=array(
                     <th width="6%">总台数</th>
                     <th width="6%">准备中</th>
                     <th width="6%">执行中</th>
+                    <th width="6%">暂停</th>
                     <th width="6%">成功</th>
                     <th width="6%">失败</th>
                     <th width="20%">进度</th>
@@ -237,7 +239,11 @@ $arrIdx=array(
 
           <div class="x_panel">
             <div class="x_title">
-              <h2 class="text-primary"><i class="fa fa-list-ul"></i> 任务细节 <small>任务分发状态详情</small></h2>
+              <h2 class="text-primary"><i class="fa fa-list-ul"></i> 任务细节
+                <small>任务分发状态详情
+                  <a class="tooltips" id="viewTaskLog" data-container="body" data-trigger="hover" data-original-title="查看日志" data-toggle="modal" data-target="#myViewModal"><i class="fa fa-comment"></i></a>
+                </small>
+              </h2>
               <ul class="nav navbar-right panel_toolbox">
                 <li><a class="collapse-link"><i class="fa fa-chevron-up"></i></a>
                 </li>
@@ -255,12 +261,16 @@ $arrIdx=array(
                   <li role="presentation" class="" id="tab_home_2">
                     <a href="#tab_2" role="tab" id="profile-tab" data-toggle="tab" aria-expanded="false">执行中<span id="num_running" class="badge bg-blue" style="position: absolute;top: -3px;right: -10px;"></span></a>
                   </li>
+                  <li role="presentation" class="" id="tab_home_5">
+                     <a href="#tab_5" role="tab" id="profile-tab2" data-toggle="tab" aria-expanded="false">暂停<span id="num_stoped" class="badge bg-orange" style="position: absolute;top: -3px;right: -10px;"></span></a>
+                  </li>
                   <li role="presentation" class="" id="tab_home_3">
                     <a href="#tab_3" role="tab" id="profile-tab2" data-toggle="tab" aria-expanded="false">成功<span id="num_success" class="badge bg-green" style="position: absolute;top: -3px;right: -10px;"></span></a>
                   </li>
                   <li role="presentation" class="" id="tab_home_4">
                     <a href="#tab_4" role="tab" id="profile-tab2" data-toggle="tab" aria-expanded="false">失败<span id="num_failed" class="badge bg-red" style="position: absolute;top: -3px;right: -10px;"></span></a>
                   </li>
+
                 </ul>
                 <div id="myTabContent" class="tab-content">
                   <div role="tabpanel" class="tab-pane fade active in" id="tab_1">
@@ -330,6 +340,23 @@ $arrIdx=array(
                       </table>
                     </div>
                   </div>
+                  <div role="tabpanel" class="tab-pane fade" id="tab_5">
+                        <div class="table-scrollable">
+                            <table class="table table-bordered table-hover">
+                                <thead class="flip-content">
+                                <tr>
+                                    <th width="4%"><div class="checker" id="uniform-SelectAll"><span><input type="checkbox" name="SelectAll" id="SelectAll" onclick="checkAll(this,'stoped')"></span></div></th>
+                                    <th width="6%">#</th>
+                                    <th width="15%">IP</th>
+                                    <th>步骤 <span class="badge bg-orange">当前</span></th>
+                                    <th width="8%">时间</th>
+                                    <th width="10%">操作</th>
+                                </tr>
+                                </thead>
+                                <tbody id="task_stoped"></tbody>
+                            </table>
+                        </div>
+                    </div>
                 </div>
               </div>
             </div>
@@ -486,13 +513,21 @@ $arrIdx=array(
     $("select.form-control").select2({width:'100%'});
     cache.task_id=<?php echo $myIdx;?>;
     window.setTimeout('getTask(\'info\');',200);
-    setInterval('getTask(\'info\');',10000);
+    cache.refreshInterval = setInterval('getTask(\'info\');',10000);
     getList();
     $('#fIdx').bind('keypress',function(event){
       if(event.keyCode == "13"){
         list(1);
       }
     });
+
+    //查看任务主日志
+    $('#viewTaskLog').click(function(){
+        view('tasklog',cache.task_id,0,0);
+    })
+
+
+
   });
   $("#myModal").on("shown.bs.modal", function(){
     $("select.form-control").select2();

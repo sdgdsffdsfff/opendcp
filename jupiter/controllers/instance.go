@@ -10,14 +10,31 @@ import (
 	"weibo.com/opendcp/jupiter/ssh"
 
 	"github.com/astaxie/beego"
+	"time"
 	"weibo.com/opendcp/jupiter/conf"
+	"weibo.com/opendcp/jupiter/logstore"
 	_ "weibo.com/opendcp/jupiter/provider/aliyun"
 	_ "weibo.com/opendcp/jupiter/provider/aws"
+	_ "weibo.com/opendcp/jupiter/provider/openstack"
+	"weibo.com/opendcp/jupiter/service/cluster"
 )
+
+const DEFAULT_CPU = 1
+const DEFAULT_RAM = 1
 
 // Operations about Instance
 type InstanceController struct {
 	BaseController
+}
+
+type AppendPhyDevRequest struct {
+	InstanceList []models.PhyAuth `json:"instancelist"`
+}
+
+type AppendPhyDevResponse struct {
+	Success int      `json:"success"`
+	Failed  int      `json:"failed"`
+	Errors  []string `json:"errors"`
 }
 
 // @Title create instance
@@ -85,7 +102,7 @@ func (ic *InstanceController) GetInstance() {
 	ic.RespJsonWithStatus()
 }
 
-// @Title Get instances
+// @Title Check status
 // @Description check instances status
 // @router status/:instanceIds [get]
 func (ic *InstanceController) GetInstancesStatus() {
@@ -107,6 +124,30 @@ func (ic *InstanceController) GetInstancesStatus() {
 	ic.RespJsonWithStatus()
 }
 
+// @Title Update machine status
+// @Description Update machine status
+// @router /status [post]
+func (ic *InstanceController) UpdateInstanceStatus() {
+	var insStat models.InstanceIdStatus
+	err := json.Unmarshal(ic.Ctx.Input.RequestBody, &insStat)
+	if err != nil {
+		beego.Error("Could parase request before create instance: ", err)
+		ic.RespInputError()
+		return
+	}
+	status, err := instance.UpdateInstanceStatus(insStat.InstanceId, insStat.Status)
+	if err != nil {
+		beego.Error("update instance status err: ", err)
+		ic.RespServiceError(err)
+		return
+	}
+	resp := ApiResponse{}
+	resp.Content = status
+	ic.ApiResponse = resp
+	ic.Status = SERVICE_SUCCESS
+	ic.RespJsonWithStatus()
+}
+
 // @Title Delete instances
 // @Description Delete many instances.
 // @router /:instanceIds [delete]
@@ -121,6 +162,14 @@ func (ic *InstanceController) DeleteMulti() {
 	for i := 0; i < len(instanceIdsArray); i++ {
 		go instance.DeleteOne(instanceIdsArray[i], correlationId)
 	}
+	go func() {
+		time.Sleep(time.Second * 10)
+		cluster.UpdateInstanceDetail()
+		time.Sleep(time.Minute)
+		cluster.UpdateInstanceDetail()
+		time.Sleep(time.Minute * 2)
+		cluster.UpdateInstanceDetail()
+	}()
 	resp := ApiResponse{}
 	ic.ApiResponse = resp
 	ic.Status = SERVICE_SUCCESS
@@ -159,6 +208,35 @@ func (ic *InstanceController) DownloadKey() {
 	}
 	ic.Ctx.Output.Download(path)
 	os.Remove(path)
+}
+
+// @Title Upload ssh key
+// @Description Upload ssh key
+// @router sshkey/:instanceId [put]
+func (ic *InstanceController) UploadKey() {
+	instanceId := ic.GetString(":instanceId")
+	if instanceId == "" {
+		ic.RespMissingParams("instanceId")
+		return
+	}
+	var sshKey models.SshKey
+	err := json.Unmarshal(ic.Ctx.Input.RequestBody, &sshKey)
+	if err != nil {
+		beego.Error("Could parase request before upload ssh key: ", err)
+		ic.RespInputError()
+		return
+	}
+	resp := ApiResponse{}
+	result, err := instance.UploadSshKey(instanceId, sshKey)
+	if err != nil {
+		beego.Error("input phy dev error:", err)
+		ic.RespServiceError(err)
+		return
+	}
+	resp.Content = result
+	ic.ApiResponse = resp
+	ic.Status = SERVICE_SUCCESS
+	ic.RespJsonWithStatus()
 }
 
 // @Title Get providers
@@ -436,3 +514,132 @@ func (ic *InstanceController) QueryLogByInstanceId() {
 	ic.RespJsonWithStatus()
 }
 
+// @Title Upload machine infomation
+// @Description Upload machine information to DB
+// @router /phydev [put]
+func (ic *InstanceController) UploadPhyDevInfo() {
+	var ins models.Instance
+	err := json.Unmarshal(ic.Ctx.Input.RequestBody, &ins)
+	if err != nil {
+		beego.Error("Could parase request before input instance: ", err)
+		ic.RespInputError()
+		return
+	}
+	resp := ApiResponse{}
+	result, err := instance.InputPhyDev(ins)
+	if err != nil {
+		beego.Error("input phy dev error:", err)
+		ic.RespServiceError(err)
+		return
+	}
+	resp.Content = result
+	ic.ApiResponse = resp
+	ic.Status = SERVICE_SUCCESS
+	ic.RespJsonWithStatus()
+}
+
+// @Title manage physical device
+// @Description manage physical device
+// @router /phydev [post]
+func (ic *InstanceController) ManagePhyDev() {
+	correlationId := ic.Ctx.Input.Header("X-CORRELATION-ID")
+	if len(correlationId) <= 0 {
+		ic.RespMissingParams("X-CORRELATION-ID")
+		return
+	}
+
+	var request AppendPhyDevRequest
+	err := json.Unmarshal(ic.Ctx.Input.RequestBody, &request)
+	if err != nil {
+		beego.Error("Could parase request before input instance: ", err)
+		ic.RespInputError()
+		return
+	}
+
+	// 1. check request form
+	for _, info := range request.InstanceList {
+		if (strings.TrimSpace(info.PublicIp) == "" && strings.TrimSpace(info.PrivateIp) == "") || strings.TrimSpace(info.Password) == "" {
+			beego.Error("Please check request")
+			ic.RespInputError()
+			return
+		}
+	}
+
+	// 2. start insert DB
+	successCount := 0
+	failedCount := 0
+	errList := make([]string, 0)
+	for _, info := range request.InstanceList {
+		ip := info.PublicIp
+		if ip == "" {
+			ip = info.PrivateIp
+		}
+		// already in database, skip
+		inst, _ := instance.GetInstanceByIp(ip)
+		if inst != nil {
+			failedCount++
+			errList = append(errList, "Instance: "+ip+" is already in DB")
+			continue
+		}
+		var ins models.Instance
+		ins.Cpu = DEFAULT_CPU
+		ins.Ram = DEFAULT_RAM
+		ins.PublicIpAddress = info.PublicIp
+		ins.PrivateIpAddress = info.PrivateIp
+
+		logstore.Info(correlationId, ins.InstanceId, "1. Insert the instance into db")
+		ins, err = instance.InputPhyDev(ins)
+
+		if err != nil {
+			failedCount++
+			errList = append(errList, err.Error())
+		} else {
+			successCount++
+			// asynchronous manage
+			logstore.Info(correlationId, ins.InstanceId, "Insert the instance into db successfully")
+			logstore.Info(correlationId, ins.InstanceId, "2. Begin to execute init operation in the instance")
+			go instance.ManageDev(ip, info.Password, ins.InstanceId, correlationId, info.Port)
+		}
+	}
+	go cluster.UpdateInstanceDetail()
+
+	// 3. response
+	resp := ApiResponse{}
+	resp.Content = AppendPhyDevResponse{
+		Success: successCount,
+		Failed:  failedCount,
+		Errors:  errList,
+	}
+	ic.ApiResponse = resp
+	if failedCount == 0 {
+		ic.Status = SERVICE_SUCCESS
+	} else {
+		ic.Status = SERVICE_ERRROR
+	}
+	ic.RespJsonWithStatus()
+}
+
+// @Title Update machine status
+// @Description change openstack config
+// @router /openstack [post]
+
+func (ic *InstanceController) ChangeOpenStackConf() {
+	var OpConf models.OpenStackConf
+	err := json.Unmarshal(ic.Ctx.Input.RequestBody, &OpConf)
+	if err != nil {
+		beego.Error("Could not parase openstack conf request : ", err)
+		ic.RespInputError()
+		return
+	}
+	err = instance.ChangeOpenStackConf(&OpConf)
+	if err != nil {
+		beego.Error("Could not change hosts: ", err)
+		ic.RespInputError()
+		return
+	}
+	resp := ApiResponse{}
+	resp.Content = OpConf
+	ic.ApiResponse = resp
+	ic.Status = SERVICE_SUCCESS
+	ic.RespJsonWithStatus()
+}
